@@ -989,6 +989,46 @@
     font-weight: 600;
     margin-top: 6px;
   }
+
+  /* Active Recall Phase */
+  .recall-prompt {
+    text-align: center;
+    padding: 32px 20px;
+    margin: 16px 0;
+    border: 2px dashed var(--line);
+    border-radius: 8px;
+    background: var(--cream);
+  }
+  .recall-prompt .recall-icon {
+    font-size: 32px;
+    margin-bottom: 12px;
+    opacity: 0.6;
+  }
+  .recall-prompt p {
+    font-family: 'Fraunces', serif;
+    font-style: italic;
+    font-size: 15px;
+    color: var(--ink-muted);
+    margin-bottom: 16px;
+    line-height: 1.5;
+  }
+  .recall-btn {
+    background: var(--paper);
+    border: 1px solid var(--topic-color, var(--accent));
+    color: var(--topic-color, var(--accent));
+    font-family: 'Manrope', sans-serif;
+    font-size: 14px;
+    font-weight: 600;
+    padding: 10px 24px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .recall-btn:hover {
+    background: var(--topic-color, var(--accent));
+    color: white;
+  }
+
   .format-badge {
     display: inline-block;
     font-family: 'Fraunces', serif;
@@ -2297,9 +2337,25 @@ function ensureQStat(stats, qId) {
       seen: 0, correct: 0, wrong: 0, confidentWrong: 0,
       lastSeen: 0,
       formats: { mc: { seen: 0, correct: 0 }, fill: { seen: 0, correct: 0 } },
-      ease: 2.5, interval: 0, due: 0, reps: 0, lapses: 0,
-      state: 'new'
+      // FSRS-4.5 fields
+      stability: 0,       // Days until 90% retention drops to target
+      difficulty: 0,       // 0-10, higher = harder
+      due: 0,              // Timestamp when card is due
+      reps: 0,             // Successful consecutive repetitions
+      lapses: 0,           // Times the card failed after graduating
+      state: 'new',        // 'new' | 'learning' | 'review' | 'relearning'
+      lastReview: 0        // Timestamp of last review
     };
+  }
+  // Migrate from old SM-2 format
+  if (stats[qId].ease !== undefined) {
+    const old = stats[qId];
+    old.stability = old.interval || 0;
+    old.difficulty = Math.min(10, Math.max(0, (3.5 - old.ease) * 5 + 5));
+    old.lastReview = old.lastSeen || 0;
+    if (old.state === 'relearning') old.state = 'relearning';
+    delete old.ease;
+    delete old.interval;
   }
   return stats[qId];
 }
@@ -2316,27 +2372,171 @@ function recordAnswer(qId, wasCorrect, confident, format) {
   return q;
 }
 
-// SM-2 grading: 0=blackout 1=wrong 2=hard 3=ok 4=easy
-function gradeCardSM2(qId, grade) {
+// ========================================================================
+//  FSRS-4.5 — Free Spaced Repetition Scheduler
+//  Based on: Ye, J. (2024). A Stochastic Shortest Path Algorithm for Optimizing
+//  Spaced Repetition Scheduling. https://github.com/open-spaced-repetition/fsrs4.5
+// ========================================================================
+
+const FSRS = (() => {
+  // Optimized default parameters (FSRS-4.5)
+  const w = [0.4072, 1.1829, 3.1262, 15.4722, 7.2102, 0.5316, 1.0651, 0.0589,
+             1.5330, 0.1418, 1.0070, 1.9395, 0.1100, 0.2939, 2.0075, 0.2424,
+             2.9466, 0.5040, 0.6468];
+  const TARGET_RETENTION = 0.9;  // 90% desired recall
+  const DAY_MS = 86400000;
+
+  // Power forgetting curve: R(t) = (1 + t / (9 * S))^(-1)
+  function retrievability(stability, elapsedDays) {
+    if (stability <= 0 || elapsedDays <= 0) return 1;
+    return Math.pow(1 + elapsedDays / (9 * stability), -1);
+  }
+
+  // Next interval from stability (days until R drops to target)
+  function nextInterval(stability) {
+    return Math.max(1, Math.round(stability * 9 * (1 / TARGET_RETENTION - 1)));
+  }
+
+  // Initial stability after first rating (for new cards)
+  function initStability(grade) {
+    // grade: 1=Again, 2=Hard, 3=Good, 4=Easy
+    return Math.max(0.1, w[grade - 1]);
+  }
+
+  // Initial difficulty after first rating
+  function initDifficulty(grade) {
+    return Math.min(10, Math.max(1, w[4] - Math.exp(w[5] * (grade - 1)) + 1));
+  }
+
+  // Update difficulty after review
+  function nextDifficulty(d, grade) {
+    const delta = -(w[6] * (grade - 3));
+    const d2 = d + delta;
+    // Mean reversion toward initial difficulty
+    const d3 = w[7] * initDifficulty(3) + (1 - w[7]) * d2;
+    return Math.min(10, Math.max(1, d3));
+  }
+
+  // Stability after successful recall
+  function nextRecallStability(d, s, r, grade) {
+    const hardPenalty = (grade === 2) ? w[15] : 1;
+    const easyBonus  = (grade === 4) ? w[16] : 1;
+    return s * (1 + Math.exp(w[8]) *
+      (11 - d) *
+      Math.pow(s, -w[9]) *
+      (Math.exp((1 - r) * w[10]) - 1) *
+      hardPenalty * easyBonus);
+  }
+
+  // Stability after forgetting (lapse)
+  function nextForgetStability(d, s, r) {
+    return w[11] *
+      Math.pow(d, -w[12]) *
+      (Math.pow(s + 1, w[13]) - 1) *
+      Math.exp((1 - r) * w[14]);
+  }
+
+  // Short-term stability for learning/relearning steps
+  function shortTermStability(s, grade) {
+    return s * Math.exp(w[17] * (grade - 3 + w[18]));
+  }
+
+  return { retrievability, nextInterval, initStability, initDifficulty,
+           nextDifficulty, nextRecallStability, nextForgetStability,
+           shortTermStability, TARGET_RETENTION, DAY_MS };
+})();
+
+// Grade a card using FSRS: 1=Again, 2=Hard, 3=Good, 4=Easy
+function gradeCardFSRS(qId, grade) {
   const stats = loadStats();
   const q = ensureQStat(stats, qId);
-  q.seen++; q.lastSeen = Date.now();
-  if (grade < 2) {
-    q.lapses++; q.wrong++; q.reps = 0; q.interval = 0;
-    q.state = 'learning'; q.ease = Math.max(1.3, q.ease - 0.2);
-  } else {
-    q.correct++; q.reps++;
-    if (q.state === 'new' || q.state === 'learning') {
-      q.state = (q.reps >= 2) ? 'review' : 'learning';
-      q.interval = (q.reps === 1) ? 1 : 3;
+  const now = Date.now();
+  q.seen++; q.lastSeen = now;
+
+  const elapsedDays = q.lastReview > 0 ? (now - q.lastReview) / FSRS.DAY_MS : 0;
+  const R = FSRS.retrievability(q.stability, elapsedDays);
+
+  if (q.state === 'new') {
+    // First time seeing this card
+    q.stability = FSRS.initStability(grade);
+    q.difficulty = FSRS.initDifficulty(grade);
+    if (grade === 1) {
+      q.state = 'learning'; q.lapses++; q.wrong++;
+      q.due = now + 60000; // 1 min
     } else {
-      q.interval = Math.round(q.interval * q.ease);
+      q.correct++; q.reps++;
+      q.state = (grade === 4) ? 'review' : 'learning';
+      q.due = (grade === 4) ? now + FSRS.nextInterval(q.stability) * FSRS.DAY_MS
+            : now + (grade === 3 ? 10 * 60000 : 5 * 60000); // 10min / 5min
     }
-    q.ease = Math.max(1.3, q.ease + (0.1 - (4 - grade) * 0.08));
+  } else if (q.state === 'learning' || q.state === 'relearning') {
+    q.difficulty = FSRS.nextDifficulty(q.difficulty, grade);
+    q.stability = FSRS.shortTermStability(q.stability, grade);
+    if (grade === 1) {
+      q.wrong++; if (q.state === 'relearning') q.lapses++;
+      q.due = now + 60000; // 1 min
+    } else if (grade === 2) {
+      q.correct++; q.reps++;
+      q.due = now + 5 * 60000; // 5 min
+    } else {
+      q.correct++; q.reps++;
+      q.state = 'review';
+      q.due = now + FSRS.nextInterval(q.stability) * FSRS.DAY_MS;
+    }
+  } else {
+    // Review state
+    q.difficulty = FSRS.nextDifficulty(q.difficulty, grade);
+    if (grade === 1) {
+      // Lapse
+      q.wrong++; q.lapses++; q.reps = 0;
+      q.stability = Math.max(0.1, FSRS.nextForgetStability(q.difficulty, q.stability, R));
+      q.state = 'relearning';
+      q.due = now + 60000; // 1 min
+    } else {
+      q.correct++; q.reps++;
+      q.stability = FSRS.nextRecallStability(q.difficulty, q.stability, R, grade);
+      q.due = now + FSRS.nextInterval(q.stability) * FSRS.DAY_MS;
+    }
   }
-  q.due = Date.now() + q.interval * 86400000;
+
+  q.lastReview = now;
   saveStats(stats);
   return q;
+}
+
+// Helper: Get retrievability for a card right now
+function getRetrievability(stats, qId) {
+  const s = stats[qId];
+  if (!s || s.state === 'new' || s.stability <= 0) return 0;
+  const elapsed = (Date.now() - (s.lastReview || s.lastSeen || 0)) / FSRS.DAY_MS;
+  return FSRS.retrievability(s.stability, elapsed);
+}
+
+// Helper: Human-readable next interval for rate buttons
+function getNextIntervalText(qId, grade) {
+  const stats = loadStats();
+  const q = ensureQStat(stats, qId);
+  const now = Date.now();
+  const elapsed = q.lastReview > 0 ? (now - q.lastReview) / FSRS.DAY_MS : 0;
+  const R = FSRS.retrievability(q.stability, elapsed);
+
+  if (q.state === 'new') {
+    if (grade === 1) return '1 min';
+    if (grade === 3) return '10 min';
+    if (grade === 4) { const d = FSRS.nextInterval(FSRS.initStability(4)); return d + (d === 1 ? ' Tag' : ' Tage'); }
+  }
+  if (q.state === 'learning' || q.state === 'relearning') {
+    if (grade === 1) return '1 min';
+    if (grade === 2) return '5 min';
+    const s2 = FSRS.shortTermStability(q.stability, grade);
+    const d = FSRS.nextInterval(s2);
+    return d + (d === 1 ? ' Tag' : ' Tage');
+  }
+  // Review
+  if (grade === 1) return '1 min';
+  const s2 = FSRS.nextRecallStability(q.difficulty, q.stability, R, grade);
+  const d = FSRS.nextInterval(s2);
+  return d + (d === 1 ? ' Tag' : ' Tage');
 }
 
 // ========================================================================
@@ -2409,6 +2609,8 @@ const state = {
   currentFormat: 'mc',
   _fillCorrect: false,
   _fillGiven: '',
+  recallPhase: true,       // MC Active Recall: question shown, options hidden
+  _recallTimestamp: 0,     // When options were revealed (for response time)
   // Lernen
   lernenQueue: [],
   lernenRevealed: false,
@@ -2476,7 +2678,7 @@ function renderHome() {
         <div class="tagline">Verstehen, üben, behalten.</div>
         <ul>
           <li>Thema wählen, Merkwissen lesen, dann üben</li>
-          <li>Karteikarten mit Spaced Repetition (SM-2)</li>
+          <li>Karteikarten mit Spaced Repetition (FSRS)</li>
           <li>Lückentext für echte Produktion</li>
           <li>Fällige Karten automatisch priorisiert</li>
         </ul>
@@ -2600,7 +2802,7 @@ function renderLernenHome() {
     <header class="masthead">
       <div class="masthead-left">
         <h1>Lernen<em>-Modus</em></h1>
-        <div class="sub">Verstehen · Üben · Wiederholen (SM-2)</div>
+        <div class="sub">Verstehen · Üben · Wiederholen (FSRS)</div>
       </div>
     </header>
 
@@ -2654,6 +2856,15 @@ function renderLernenHome() {
       </div>
     `;
   }
+
+  // Interleaved learning option
+  html += '<div class="section-label">Themen\u00fcbergreifend</div>';
+  html += '<div class="quick-actions" style="margin-bottom:28px">';
+  html += '<button class="quick-btn" onclick="startLernenInterleaved()" style="--topic-color:var(--lernen)">';
+  html += '<span class="q-icon" style="font-family:Fraunces,serif;font-weight:700;color:var(--lernen)">⟳</span>';
+  html += '<div class="q-text"><strong>Gemischt lernen</strong>';
+  html += '<span>10 Karten aus allen Themen, intelligent gemischt (Interleaving)</span></div>';
+  html += '</button></div>';
 
   // Topic overview with Merkwissen — this is the heart of Lernen
   html += '<div class="section-label">Themen durcharbeiten</div>';
@@ -2785,6 +2996,7 @@ function resetQuizState() {
   state.currentQ = 0; state.score = 0; state.wrong = [];
   state.selected = null; state.answered = false; state.confidence = null;
   state._fillCorrect = false; state._fillGiven = '';
+  state.recallPhase = true; state._recallTimestamp = 0;
   state.view = 'quiz';
 }
 
@@ -2836,6 +3048,16 @@ function renderQuizMC(q) {
   html += '</div>';
   html += '<div class="q-text">' + q.q + '</div>';
 
+  // Active Recall Phase: show question, hide options
+  if (state.recallPhase && !state.answered) {
+    html += '<div class="recall-prompt">';
+    html += '<div class="recall-icon">💭</div>';
+    html += '<p>Überlege zuerst: Was könnte die Antwort sein?<br>Erst denken, dann die Optionen sehen.</p>';
+    html += '<button class="recall-btn" onclick="revealOptions()">Optionen zeigen →</button>';
+    html += '</div>';
+    return html;
+  }
+
   if (!state.answered) {
     html += '<div class="confidence">';
     html += '<span class="confidence-label">Wie sicher bist du?</span>';
@@ -2886,6 +3108,12 @@ function renderQuizMC(q) {
   }
   html += '</div>';
   return html;
+}
+
+function revealOptions() {
+  state.recallPhase = false;
+  state._recallTimestamp = Date.now();
+  renderQuiz();
 }
 
 function renderQuizFill(q) {
@@ -2968,6 +3196,7 @@ function nextQuestion() {
     state.currentQ++;
     state.selected = null; state.answered = false; state.confidence = null;
     state._fillCorrect = false; state._fillGiven = '';
+    state.recallPhase = true; state._recallTimestamp = 0;
     renderQuiz();
   } else {
     renderResult();
@@ -3070,16 +3299,23 @@ function startLernenTopic(key) {
     Object.assign({}, q, { topicKey: key, topicName: t.name, color: t.color, colorSoft: t.colorSoft })
   );
 
-  // Sort: due first, then new, then by ease
+  // Sort: due cards first (lowest retrievability = most urgent), then new
   pool.sort((a, b) => {
     const sa = stats[a._id], sb = stats[b._id];
-    const dueA = sa ? (sa.due || 0) : 0;
-    const dueB = sb ? (sb.due || 0) : 0;
-    const easeA = sa ? sa.ease : 2.5;
-    const easeB = sb ? sb.ease : 2.5;
-    if (dueA <= now && dueB > now) return -1;
-    if (dueB <= now && dueA > now) return 1;
-    return easeA - easeB;
+    const stateA = sa ? sa.state : 'new', stateB = sb ? sb.state : 'new';
+    const dueA = sa ? (sa.due || 0) : 0, dueB = sb ? (sb.due || 0) : 0;
+    // Due cards before non-due
+    const isDueA = dueA > 0 && dueA <= now, isDueB = dueB > 0 && dueB <= now;
+    if (isDueA && !isDueB) return -1;
+    if (isDueB && !isDueA) return 1;
+    // Among due cards: lowest retrievability first (most forgotten)
+    if (isDueA && isDueB) {
+      return getRetrievability(stats, a._id) - getRetrievability(stats, b._id);
+    }
+    // New cards before future-due cards
+    if (stateA === 'new' && stateB !== 'new') return -1;
+    if (stateB === 'new' && stateA !== 'new') return 1;
+    return 0;
   });
 
   state.lernenQueue = pool.slice(0, 10).map(q => { q._format = chooseFormat(q); return q; });
@@ -3087,6 +3323,59 @@ function startLernenTopic(key) {
   state._lernenFillGiven = ''; state._lernenFillCorrect = false;
   state.view = 'lernen-card';
   renderLernenCard();
+}
+
+function startLernenInterleaved() {
+  const stats = loadStats();
+  const now = Date.now();
+  const allQs = allQuestionsFlat();
+
+  // Collect all cards with retrievability score
+  const scored = allQs.map(q => {
+    const s = stats[q._id];
+    ensureQStat(stats, q._id);
+    const st = stats[q._id];
+    let priority;
+    if (!s || st.state === 'new') {
+      priority = 0.5; // New cards get medium priority
+    } else if (st.due && st.due <= now) {
+      priority = 1 - getRetrievability(stats, q._id); // Lower R = higher priority
+    } else {
+      priority = -1; // Not due yet
+    }
+    return { q, priority, topic: q.topicKey };
+  });
+
+  // Take due + new cards, sorted by priority (highest first)
+  let candidates = scored.filter(x => x.priority >= 0).sort((a, b) => b.priority - a.priority);
+  if (candidates.length === 0) { alert('Keine Karten zum Üben.'); return; }
+
+  // Take top 10, then apply interleaving sort (maximize topic switches)
+  const selected = candidates.slice(0, 10);
+  const interleaved = interleaveByTopic(selected);
+
+  state.lernenQueue = interleaved.map(x => { x.q._format = chooseFormat(x.q); return x.q; });
+  state.lernenRevealed = false; state.lernenDone = 0;
+  state._lernenFillGiven = ''; state._lernenFillCorrect = false;
+  state.view = 'lernen-card';
+  renderLernenCard();
+}
+
+// Sort cards to maximize topic switches (greedy interleaving)
+function interleaveByTopic(items) {
+  if (items.length <= 1) return items;
+  const result = [];
+  const remaining = items.slice();
+  let lastTopic = null;
+  while (remaining.length > 0) {
+    // Try to find a card from a different topic
+    let idx = remaining.findIndex(x => x.topic !== lastTopic);
+    if (idx === -1) idx = 0; // All same topic, just take first
+    result.push(remaining[idx]);
+    lastTopic = remaining[idx].topic;
+    remaining.splice(idx, 1);
+  }
+  return result;
 }
 
 // ========================================================================
@@ -3179,20 +3468,24 @@ function renderLernenFill(q) {
 }
 
 function renderRateButtons() {
+  const q = state.lernenQueue[0];
+  const againT = getNextIntervalText(q._id, 1);
+  const goodT  = getNextIntervalText(q._id, 3);
+  const easyT  = getNextIntervalText(q._id, 4);
   return `
     <div class="section-label" style="margin-top:22px;">Wie gut wusstest du es?</div>
     <div class="rate-grid">
       <button class="rate-btn again" onclick="rateLernen('again')">
         <span class="rate-title">Nochmal</span>
-        <span class="rate-when">gleich wieder</span>
+        <span class="rate-when">${againT}</span>
       </button>
       <button class="rate-btn gut" onclick="rateLernen('gut')">
         <span class="rate-title">Gut</span>
-        <span class="rate-when">in ~1 Tag</span>
+        <span class="rate-when">${goodT}</span>
       </button>
       <button class="rate-btn einfach" onclick="rateLernen('einfach')">
         <span class="rate-title">Einfach</span>
-        <span class="rate-when">in ~3 Tagen</span>
+        <span class="rate-when">${easyT}</span>
       </button>
     </div>`;
 }
@@ -3217,11 +3510,11 @@ function submitLernenFill() {
 
 function rateLernen(rating) {
   const q = state.lernenQueue[0];
-  const gradeMap = { again: 0, gut: 3, einfach: 4 };
-  const grade = gradeMap[rating] || 0;
+  const gradeMap = { again: 1, gut: 3, einfach: 4 };
+  const grade = gradeMap[rating] || 1;
   const format = (q._format === 'fill' && q.fill) ? 'fill' : 'mc';
 
-  gradeCardSM2(q._id, grade);
+  gradeCardFSRS(q._id, grade);
   const stats = loadStats();
   const s = ensureQStat(stats, q._id);
   s.formats[format].seen++;
@@ -3329,52 +3622,88 @@ function showTheoryModal() {
   overlay.innerHTML = `
     <div class="modal-box">
       <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">×</button>
-      <h3>Warum zwei Modi?</h3>
+      <h3>Methodik &amp; Wissenschaft</h3>
 
-      <h4>Zwei Systeme im Kopf</h4>
+      <h4>1. Zwei Systeme im Kopf</h4>
       <p>
         Der Psychologe Daniel Kahneman unterscheidet zwei Denkmodi:
         <b>System 1</b> arbeitet schnell, automatisch und intuitiv —
         <b>System 2</b> langsam, bewusst und analytisch.
         Lernen braucht beides: schnelles Abrufen unter Druck und tiefes Verarbeiten mit Zeit.
       </p>
-
-      <h4>Sprint-Modus → System 1</h4>
       <p>
-        Gewichtete Zufallsauswahl priorisiert Fragen, die du häufiger falsch beantwortest oder
-        bei denen du fälschlicherweise sicher warst (<em>confident errors</em>).
-        Das Ziel ist nicht perfektes Lernen, sondern schnelles Aufdecken von Lücken.
-        Die Mischung aus Multiple Choice und Lückentext zwingt dich, zwischen
-        Wiedererkennung und echter Produktion zu wechseln.
+        <b>Sprint-Modus → System 1:</b> Gewichtete Zufallsauswahl priorisiert Schwächen und
+        <em>confident errors</em>. Ziel: Lücken aufdecken, nicht perfekt lernen.
+      </p>
+      <p>
+        <b>Lernen-Modus → System 2:</b> Karteikarten mit adaptivem Scheduling. Merkwissen
+        liefert Kontext, Karten festigen das Wissen langfristig.
       </p>
 
-      <h4>Lernen-Modus → System 2</h4>
+      <h4>2. Spacing — FSRS statt SM-2</h4>
       <p>
-        Karteikarten mit dem SM-2-Algorithmus: Du bewertest selbst, wie gut du eine Antwort
-        wusstest. Die App berechnet daraus den optimalen Wiederholungszeitpunkt — kurz bevor
-        du es vergessen würdest (<em>Spacing Effect</em>). Schwierige Karten kommen öfter,
-        leichte seltener. Das Merkwissen pro Thema liefert den Kontext zum Verstehen.
+        Diese App nutzt <b>FSRS-4.5</b> (Free Spaced Repetition Scheduler), nicht den
+        älteren SM-2 von Anki. FSRS modelliert das Gedächtnis mit drei Komponenten:
+      </p>
+      <p>
+        <b>Stabilität</b> — wie viele Tage eine Erinnerung hält, bevor sie unter die
+        Ziel-Abrufrate (90%) fällt. <b>Schwierigkeit</b> — wie leicht oder schwer du
+        eine Karte findest (1–10). <b>Abrufwahrscheinlichkeit</b> — wie wahrscheinlich
+        du die Antwort jetzt noch weißt, basierend auf der Vergessenskurve
+        R(t) = (1 + t/9S)<sup>−1</sup>.
+      </p>
+      <p>
+        Jede Bewertung (Nochmal / Gut / Einfach) aktualisiert alle drei Werte.
+        Das nächste Intervall wird so berechnet, dass du die Karte genau dann
+        wiedersiehst, wenn deine Abrufwahrscheinlichkeit auf 90% gefallen ist —
+        der optimale Zeitpunkt zwischen zu früh (Zeitverschwendung) und zu spät (vergessen).
+        Studien zeigen ~30% weniger Wiederholungen bei gleicher Behaltensleistung
+        im Vergleich zu SM-2.
       </p>
 
-      <h4>Warum Lückentext?</h4>
+      <h4>3. Active Recall — Erst denken, dann prüfen</h4>
       <p>
-        Multiple Choice testet Wiedererkennung — du siehst die richtige Antwort und musst sie
-        nur identifizieren. Lückentext fordert <em>Active Recall</em>: die Antwort muss aus dem
-        Gedächtnis produziert werden. Das ist schwerer, aber der Lerneffekt ist nachweislich
-        größer (<em>Desirable Difficulty</em>, Bjork 1994).
+        Bei Multiple-Choice-Fragen siehst du zuerst <em>nur die Frage</em>, ohne Optionen.
+        Du sollst versuchen, die Antwort selbst abzurufen, bevor du die Optionen einblendest.
+        Dieser zusätzliche Abrufversuch aktiviert tiefere Gedächtnisspuren als reines
+        Wiedererkennen — der sogenannte <em>Testing Effect</em> (Roediger &amp; Butler, 2011).
+      </p>
+      <p>
+        Lückentext geht noch weiter: Hier musst du die Antwort komplett aus dem Gedächtnis
+        produzieren. Das ist schwerer, aber der Lerneffekt ist größer —
+        eine <em>Desirable Difficulty</em> (Bjork &amp; Bjork, 2020).
       </p>
 
-      <h4>Keine Gamification</h4>
+      <h4>4. Interleaving — Themen mischen</h4>
       <p>
-        Streaks, Punkte und Feier-Animationen erzeugen extrinsische Motivation, die das eigentliche
-        Ziel — Verstehen und Behalten — überlagert. Diese App gibt dir stattdessen diagnostisches
-        Feedback: Was sitzt, was nicht, wo lohnt sich Arbeit. Nicht mehr, nicht weniger.
+        Im Lernen-Modus kannst du <b>„Gemischt lernen"</b> wählen: Karten aus allen Themen
+        werden so sortiert, dass aufeinanderfolgende Karten möglichst verschiedene Themen
+        behandeln. Dieser Kontextwechsel (<em>Interleaving</em>) zwingt dein Gehirn,
+        nicht nur die Antwort, sondern auch die <em>Strategie</em> abzurufen — welche
+        Regel gilt hier? Kommaregel oder Relativsatz?
+      </p>
+      <p>
+        Rohrer (2015) zeigt: Interleaving verbessert die Unterscheidungsfähigkeit
+        bei ähnlichen Konzepten um 20–50% im Vergleich zu Block-Lernen, gemessen
+        an verzögerten Tests.
+      </p>
+
+      <h4>5. Keine Gamification</h4>
+      <p>
+        Streaks, Punkte und Feier-Animationen erzeugen extrinsische Motivation, die das
+        eigentliche Ziel — Verstehen und Behalten — überlagert. Diese App gibt dir
+        stattdessen diagnostisches Feedback: Was sitzt, was nicht, wo lohnt sich Arbeit.
       </p>
 
       <div class="source">
-        Kahneman, D. (2011). <em>Thinking, Fast and Slow.</em><br>
+        <b>Quellen</b><br>
+        Kahneman, D. (2011). <em>Thinking, Fast and Slow.</em> Farrar, Straus and Giroux.<br>
         Bjork, R. A. (1994). Memory and metamemory considerations in the training of human beings.<br>
-        Wozniak, P. A. &amp; Gorzelanczyk, E. J. (1994). Optimization of repetition spacing (SM-2).
+        Bjork, R. A. &amp; Bjork, E. L. (2020). Desirable difficulties in theory and practice. In: <em>Psychology and the Real World.</em><br>
+        Wozniak, P. A. &amp; Gorzelanczyk, E. J. (1994). Optimization of repetition spacing in the practice of learning. <em>Acta Neurobiologiae Experimentalis.</em><br>
+        Ye, J. (2024). A stochastic shortest path algorithm for optimizing spaced repetition scheduling. <em>FSRS-4.5.</em> github.com/open-spaced-repetition.<br>
+        Roediger, H. L. &amp; Butler, A. C. (2011). The critical role of retrieval practice in long-term retention. <em>Trends in Cognitive Sciences.</em><br>
+        Rohrer, D. (2015). Interleaving helps students distinguish among similar concepts. <em>Educational Psychology Review.</em>
       </div>
     </div>
   `;
